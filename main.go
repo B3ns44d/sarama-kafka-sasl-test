@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
@@ -9,6 +10,8 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/Shopify/sarama"
 )
@@ -26,10 +29,10 @@ var (
 	certFile      = flag.String("certificate", "", "The optional certificate file for client authentication")
 	keyFile       = flag.String("key", "", "The optional key file for client authentication")
 	caFile        = flag.String("ca", "", "The optional certificate authority file for TLS client authentication")
-	tlsSkipVerify = flag.Bool("tls-skip-verify", false, "Whether to skip TLS server cert verification")
-	useTLS        = flag.Bool("tls", false, "Use TLS to communicate with the cluster")
-	mode          = flag.String("mode", "produce", "Mode to run in: \"produce\" to produce, \"consume\" to consume")
-	logMsg        = flag.Bool("logmsg", false, "True to log consumed messages to console")
+	tlsSkipVerify = flag.Bool("tls-skip-verify", true, "Whether to skip TLS server cert verification")
+	useTLS        = flag.Bool("tls", true, "Use TLS to communicate with the cluster")
+	mode          = flag.String("mode", "consume", "Mode to run in: \"produce\" to produce, \"consume\" to consume")
+	logMsg        = flag.Bool("logmsg", true, "True to log consumed messages to console")
 
 	logger = log.New(os.Stdout, "[Producer] ", log.LstdFlags)
 )
@@ -82,7 +85,7 @@ func main() {
 	conf.Producer.RequiredAcks = sarama.WaitForAll
 	conf.Producer.Return.Successes = true
 	conf.Metadata.Full = true
-	conf.Version = sarama.V0_10_0_0
+	conf.Version = sarama.V0_10_2_0
 	conf.ClientID = "sasl_scram_client"
 	conf.Metadata.Full = true
 	conf.Net.SASL.Enable = true
@@ -111,65 +114,100 @@ func main() {
 	}
 	fmt.Print("client created", client)
 
-	if *mode == "consume" {
-		consumer, err := sarama.NewConsumerFromClient(client)
-		if err != nil {
-			panic(err)
-		}
-		log.Println("consumer created")
-		defer func() {
-			if err := consumer.Close(); err != nil {
-				log.Fatalln(err)
-			}
-		}()
-		log.Println("commence consuming")
-		partitionConsumer, err := consumer.ConsumePartition(*topic, 0, sarama.OffsetOldest)
-		if err != nil {
-			panic(err)
-		}
-
-		defer func() {
-			if err := partitionConsumer.Close(); err != nil {
-				log.Fatalln(err)
-			}
-		}()
-
-		// Trap SIGINT to trigger a shutdown.
-		signals := make(chan os.Signal, 1)
-		signal.Notify(signals, os.Interrupt)
-
-		consumed := 0
-	ConsumerLoop:
-		for {
-			log.Println("in the for")
-			select {
-			case msg := <-partitionConsumer.Messages():
-				log.Printf("Consumed message offset %d\n", msg.Offset)
-				if *logMsg {
-					log.Printf("KEY: %s VALUE: %s", msg.Key, msg.Value)
-				}
-				consumed++
-			case <-signals:
-				break ConsumerLoop
-			}
-		}
-
-		log.Printf("Consumed: %d\n", consumed)
-
-	} else {
-		syncProducer, err := sarama.NewSyncProducerFromClient(client)
-		if err != nil {
-			logger.Fatalln("failed to create producer: ", err)
-		}
-		partition, offset, err := syncProducer.SendMessage(&sarama.ProducerMessage{
-			Topic: *topic,
-			Value: sarama.StringEncoder("test_message"),
-		})
-		if err != nil {
-			logger.Fatalln("failed to send message to ", *topic, err)
-		}
-		logger.Printf("wrote message at partition: %d, offset: %d", partition, offset)
-		_ = syncProducer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	consumerClient, err := sarama.NewClient(splitBrokers, conf)
+	if err != nil {
+		log.Panicf("Error creating consumer client: %v", err)
 	}
-	logger.Println("Bye now !")
+	defer func(consumerClient sarama.Client) {
+		err := consumerClient.Close()
+		if err != nil {
+			print(err)
+		}
+	}(consumerClient)
+
+	consumerGroup, err := sarama.NewConsumerGroupFromClient("knative-consumer-group-name", consumerClient)
+	if err != nil {
+		log.Panicf("Error creating consumer group client: %v", err)
+	}
+
+	consumer := Consumer{
+		ready: make(chan bool),
+	}
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			// `Consume` should be called inside an infinite loop, when a
+			// server-side rebalance happens, the consumer session will need to be
+			// recreated to get the new claims
+			topics := strings.Split(*topic, ",")
+			if err := consumerGroup.Consume(ctx, topics, &consumer); err != nil {
+				log.Panicf("Error from consumer: %v", err)
+			}
+			// check if context was cancelled, signaling that the consumer should stop
+			if ctx.Err() != nil {
+				return
+			}
+			consumer.ready = make(chan bool)
+		}
+	}()
+
+	<-consumer.ready // Await till the consumer has been set up
+	log.Println("Sarama consumer up and running!...")
+
+	sigterm := make(chan os.Signal, 1)
+	signal.Notify(sigterm, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case <-ctx.Done():
+		log.Println("terminating: context cancelled")
+	case <-sigterm:
+		log.Println("terminating: via signal")
+	}
+	cancel()
+	wg.Wait()
+	if err = client.Close(); err != nil {
+		log.Panicf("Error closing client: %v", err)
+	}
+
+	logger.Println("Bye now!")
+}
+
+// Consumer represents a Sarama consumer group consumer
+type Consumer struct {
+	ready chan bool
+}
+
+// Setup is run at the beginning of a new session, before ConsumeClaim
+func (consumer *Consumer) Setup(sarama.ConsumerGroupSession) error {
+	// Mark the consumer as ready
+	close(consumer.ready)
+	return nil
+}
+
+// Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
+func (consumer *Consumer) Cleanup(sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+// ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
+func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	// NOTE:
+	// Do not move the code below to a goroutine.
+	// The `ConsumeClaim` itself is called within a goroutine, see:
+	// https://github.com/Shopify/sarama/blob/main/consumer_group.go#L27-L29
+	for {
+		select {
+		case message := <-claim.Messages():
+			log.Printf("Message claimed: value = %s, timestamp = %v, topic = %s", string(message.Value), message.Timestamp, message.Topic)
+			session.MarkMessage(message, "")
+
+		// Should return when `session.Context()` is done.
+		// If not, will raise `ErrRebalanceInProgress` or `read tcp <ip>:<port>: i/o timeout` when kafka rebalance. see:
+		// https://github.com/Shopify/sarama/issues/1192
+		case <-session.Context().Done():
+			return nil
+		}
+	}
 }
